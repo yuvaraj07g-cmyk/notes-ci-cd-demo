@@ -1,0 +1,55 @@
+# CD: after CI is green on main -> update the database -> deploy that exact commit -> smoke test.
+# Rollback: Actions -> CD -> Run workflow -> paste an older commit SHA.
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA to deploy (rollback)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.LIVE_URL }}
+    env:
+      SHA: ${{ github.event.inputs.sha || github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # Normal deploys only. A rollback must not touch the database.
+      - name: Update tables on Neon
+        if: github.event_name == 'workflow_run'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m app.migrate
+
+      - name: Tell Render to deploy this exact commit
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          echo "Deploying commit $SHA"
+          curl --fail --silent --show-error -X POST "${HOOK}&ref=${SHA}"
+
+      - name: Smoke test the live URL
+        run: python3 scripts/smoke.py "${{ vars.LIVE_URL }}" --expect-sha "$SHA"
